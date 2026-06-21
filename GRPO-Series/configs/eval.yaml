@@ -1,0 +1,67 @@
+# 基准评测配置：GSM8K + MATH-500
+# 用法: uv run python evaluate_models.py --config configs/eval.yaml
+
+model:
+  base_model_path: "models/Qwen2.5-3B-Instruct"
+  device: "cuda"
+  dtype: "bfloat16"
+
+models:
+  full:
+    ckpt_path: null
+  lora:
+    lora_config:
+      r: 32
+      alpha: 64
+      dropout: 0.0
+      target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+benchmarks:
+  gsm8k:
+    path: "data/gsm8k/test-00000-of-00001.parquet"
+  math500:
+    path: "data/MATH-500/test.jsonl"
+
+eval:
+  model_targets:
+    - name: "base"
+      type: "base"
+    - name: "full"
+      type: "full"
+      ckpt_path: null
+  # 评测 LoRA checkpoint 时取消注释并填写路径，例如:
+  #   - name: "lora_ckpt"
+  #     type: "lora"
+  #     ckpt_paths:
+  #       - "logs/<run_dir>/ckpt_000100.pt"
+
+  batch_size: 256
+  max_gen_len: 1024
+  pass_at_k: [1]
+  num_samples: 1
+  sampling:
+    do_sample: true
+    temperature: 1.0
+    top_p: 1.0
+    top_k: 0
+
+  benchmark_overrides:
+    gsm8k:
+      batch_size: 1024
+      max_gen_len: 1024
+      sampling:
+        do_sample: true
+        temperature: 1.0
+        top_p: 1.0
+        top_k: 0
+    math500:
+      batch_size: 256
+      max_gen_len: 2048
+      sampling:
+        do_sample: true
+        temperature: 1.0
+        top_p: 1.0
+        top_k: 0
+
+  show_progress: true
+  output_dir: "logs/eval"

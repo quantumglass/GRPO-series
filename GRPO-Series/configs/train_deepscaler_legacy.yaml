@@ -1,0 +1,36 @@
+# 简化版 DeepScaler + LoRA 训练（早期实验入口，推荐使用 train_unified.py）
+# 用法: uv run python train_deepscaler_legacy.py --config configs/train_deepscaler_legacy.yaml
+
+model:
+  pretrained_model_path: "models/Qwen2.5-3B-Instruct"
+  device: "cuda"
+  dtype: "bfloat16"
+
+data:
+  json_path: "data/deepscaler/deepscaler.json"
+  test_size: 300
+
+training:
+  random_seed: 1337
+  max_prompt_len: 256
+  max_gen_len: 1024
+  batch_size: 64
+  num_questions_per_batch: 8
+  micro_batch_size: 2
+  max_grad_norm: 0.9
+  learning_rate: 5.0e-5
+  weight_decay: 0.0
+  betas: [0.9, 0.98]
+  lora:
+    enabled: true
+    r: 32
+    alpha: 32
+    dropout: 0.0
+    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+  resume_lora_ckpt: null
+  ckpt_dir: "ckpt_deepscaler"
+  log_dir: "logs"
+  skip_unfinished_episodes: true
+  ckpt_save_interval: 50
+  eval_interval: 50
+  memory_efficient_adamw: false

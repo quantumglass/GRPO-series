@@ -1,0 +1,70 @@
+# R1 风格长思考训练：复合奖励（准确率 + 格式 + 长度）
+# 用法: uv run python train_r1_thinking.py --config configs/train_r1_thinking.yaml
+
+model:
+  pretrained_model_path: "models/Qwen2.5-3B-Instruct"
+  device: "cuda"
+  dtype: "bfloat16"
+
+dataset:
+  name: "deepscaler"
+  countdown_path: "data/Countdown-Tasks-3to4"
+  dapo_parquet_path: "data/DAPO-Math-17k/data/dapo-math-17k.parquet"
+  deepscaler_json_path: "data/deepscaler/deepscaler.json"
+  test_size: 256
+
+training:
+  mode: "lora"
+  random_seed: 1337
+  max_prompt_len: 1024
+  max_gen_len: 1536
+
+  sampling:
+    do_sample: true
+    temperature: 1.1
+    top_p: 1.0
+    top_k: 0
+
+  r1_reward:
+    w_accuracy: 1.0
+    w_format: 0.2
+    w_length: 0.05
+    min_thinking_chars: 120
+    target_thinking_chars: 2048
+    partial_format_credit: false
+
+  use_ppo_clip: true
+  advantage_mode: "grpo"
+  gspo_clip_len_scaling: "none"
+  beta: 0.02
+  clip_ratio_low: 0.2
+  clip_ratio_high: 0.32
+  ppo_epochs: 3
+  advantage_std_threshold: 1.0e-4
+  center_advantages: true
+  scale_advantages_by_std: true
+  advantage_std_epsilon: 1.0e-4
+  drop_zero_adv_groups: true
+
+  batch_size: 768
+  num_questions_per_batch: 48
+  rollout_chunk_size: 768
+  micro_batch_size: 3
+  max_grad_norm: 0.9
+  learning_rate: 2.0e-5
+  weight_decay: 0.1
+  betas: [0.9, 0.99]
+
+  lora:
+    r: 32
+    alpha: 64
+    dropout: 0.0
+    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+  log_dir: "logs"
+  resume_lora_ckpt: null
+  resume_log_dir: null
+  skip_unfinished_episodes: false
+  ckpt_save_interval: 10
+  eval_interval: 10
+  memory_efficient_adamw: false

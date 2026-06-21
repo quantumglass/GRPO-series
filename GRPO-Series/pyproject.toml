@@ -1,0 +1,40 @@
+[project]
+name = "grpo-series"
+version = "0.2.0"
+description = "GRPO-Series: single-GPU educational RL framework for the GRPO algorithm family, based on GRPO-Zero."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "accelerate>=1.13.0",
+    "datasets>=3.0.0",
+    "jinja2>=3.1.6",
+    "pandas>=2.2.3",
+    "pyarrow>=19.0.1",
+    "pyyaml>=6.0.2",
+    "safetensors>=0.5.3",
+    "tensorboard>=2.19.0",
+    "tokenizers>=0.21.1",
+    "torch>=2.7.0",
+    "transformers>=5.10.2",
+]
+
+[dependency-groups]
+dev = [
+    "pytype>=2024.10.11",
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu128" }
+]
+torchvision = [
+    { index = "pytorch-cu128" }
+]
+torchaudio = [
+    { index = "pytorch-cu128" }
+]
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
