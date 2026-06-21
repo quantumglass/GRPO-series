@@ -123,7 +123,7 @@ GRPO-Series/
 
 ## 环境安装
 
-要求 Python >= 3.11，推荐 NVIDIA GPU（数学 LoRA 训练建议 32 GB+ 显存）。
+要求 Python >= 3.11，推荐 NVIDIA GPU（数学 LoRA 训练建议 24 GB+ 显存）。
 
 ```bash
 pip install uv
