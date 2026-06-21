@@ -126,7 +126,7 @@ pip install uv
 uv sync
 ```
 
-Requires Python >= 3.11 and an NVIDIA GPU (32 GB+ recommended for math LoRA training).
+Requires Python >= 3.11 and an NVIDIA GPU (24 GB+ recommended for math LoRA training).
 
 ### Download assets
 
