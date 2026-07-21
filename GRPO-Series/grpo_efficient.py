@@ -35,6 +35,10 @@ def rollout_chunked(
     dtype: torch.dtype,
     sampling=None,
     rollout_chunk_size: int | None = None,
+    end_token: str | None = None,
+    end_token_id: int | None = None,
+    stop_token_ids: list[int] | None = None,
+    treat_max_length_as_finished: bool = False,
 ) -> List[Episode]:
     """
     将一个大 batch 拆成多个小 batch 依次 rollout，降低 KV cache 峰值。
@@ -54,6 +58,10 @@ def rollout_chunked(
             device=device,
             dtype=dtype,
             sampling=sampling,
+            end_token=end_token,
+            end_token_id=end_token_id,
+            stop_token_ids=stop_token_ids,
+            treat_max_length_as_finished=treat_max_length_as_finished,
         )
 
     questions_per_chunk = max(rollout_chunk_size // num_answer_per_question, 1)
@@ -71,6 +79,10 @@ def rollout_chunked(
             device=device,
             dtype=dtype,
             sampling=sampling,
+            end_token=end_token,
+            end_token_id=end_token_id,
+            stop_token_ids=stop_token_ids,
+            treat_max_length_as_finished=treat_max_length_as_finished,
         )
         episodes.extend(sub_eps)
         if device.type == "cuda":

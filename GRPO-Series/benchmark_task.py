@@ -16,7 +16,21 @@ def _canonical_benchmark_name(dataset_name: str) -> str:
 
 
 def is_math_benchmark(dataset_name: str) -> bool:
-    return _canonical_benchmark_name(dataset_name).replace("-", "") == "math500"
+    key = _canonical_benchmark_name(dataset_name).replace("-", "")
+    return key in {"math500", "math", "competitionmath"}
+
+
+def is_aime_benchmark(dataset_name: str) -> bool:
+    return "aime" in _canonical_benchmark_name(dataset_name)
+
+
+def normalize_aime_answer(text: str) -> str:
+    """Normalize AIME integer answer (0-999), stripping leading zeros."""
+    s = str(text).strip()
+    nums = re.findall(r"[-]?\d+", s)
+    if not nums:
+        return s
+    return str(int(nums[-1]))
 
 
 SYSTEM_MESSAGE = (
@@ -107,6 +121,19 @@ class GenericMathBenchmarkDataset(Dataset):
                     "MATH500 row requires one of ['answer', 'solution']. "
                     f"Available keys: {sorted(sample_keys)}"
                 )
+            return
+
+        if is_aime_benchmark(self.dataset_name):
+            if "problem" not in sample_keys and "question" not in sample_keys:
+                raise KeyError(
+                    "AIME row requires one of ['problem', 'question']. "
+                    f"Available keys: {sorted(sample_keys)}"
+                )
+            if "answer" not in sample_keys:
+                raise KeyError(
+                    "AIME row requires 'answer'. "
+                    f"Available keys: {sorted(sample_keys)}"
+                )
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         row = self.rows[idx]
@@ -140,6 +167,11 @@ class GenericMathBenchmarkDataset(Dataset):
             if boxed:
                 return normalize_math_answer(boxed.group(1))
             return solution
+
+        if is_aime_benchmark(self.dataset_name):
+            if row.get("answer") is not None:
+                return normalize_aime_answer(str(row["answer"]))
+            raise KeyError("AIME row is missing required field 'answer'.")
 
         candidates = ["answer", "final_answer", "ground_truth", "target"]
         for key in candidates:
@@ -271,11 +303,15 @@ def extract_pred_answer(response: str, dataset_name: str = "gsm8k") -> str | Non
     nums = re.findall(r"[-]?\d+(?:,\d{3})*(?:\.\d+)?", answer_text)
     if nums:
         val = nums[-1].replace(",", "").strip()
+        if is_aime_benchmark(name):
+            return normalize_aime_answer(val)
         if "." in val:
             val = val.rstrip("0").rstrip(".")
         return val
 
     cleaned = answer_text.strip()
+    if cleaned and is_aime_benchmark(name):
+        return normalize_aime_answer(cleaned)
     return cleaned if cleaned else None
 
 
@@ -286,6 +322,12 @@ def answer_matches(pred: str | None, gt: str, dataset_name: str = "gsm8k") -> bo
     name = _canonical_benchmark_name(dataset_name)
     if is_math_benchmark(name):
         return math_answers_match(normalize_math_answer(pred), normalize_math_answer(gt))
+
+    if is_aime_benchmark(name):
+        try:
+            return int(normalize_aime_answer(pred)) == int(normalize_aime_answer(gt))
+        except ValueError:
+            return False
 
     p = pred.strip()
     g = str(gt).strip()

@@ -1,17 +1,20 @@
 [project]
 name = "grpo-series"
-version = "0.2.0"
-description = "GRPO-Series: single-GPU educational RL framework for the GRPO algorithm family, based on GRPO-Zero."
+version = "0.3.0"
+description = "GRPO-Series: single-GPU educational RL framework for the GRPO algorithm family (GRPO/GSPO/ExGRPO), based on GRPO-Zero."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "accelerate>=1.13.0",
     "datasets>=3.0.0",
     "jinja2>=3.1.6",
+    "latex2sympy2>=1.9.0",
     "pandas>=2.2.3",
     "pyarrow>=19.0.1",
     "pyyaml>=6.0.2",
+    "regex>=2024.0.0",
     "safetensors>=0.5.3",
+    "sympy>=1.13.0",
     "tensorboard>=2.19.0",
     "tokenizers>=0.21.1",
     "torch>=2.7.0",

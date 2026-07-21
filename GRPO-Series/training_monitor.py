@@ -24,6 +24,10 @@ SCALAR_TAGS = [
     "approx_kl",
     "clip_fraction",
     "nonzero_adv_frac",
+    "group_reward_std_mean",
+    "kept_group_reward_std_mean",
+    "group_below_threshold_frac",
+    "advantage_std",
     "format_reward",
     "thinking_chars",
     "mean_response_len",
@@ -353,20 +357,28 @@ class ConfigEditor:
                 self.yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
             f.write(f"\n# [monitor] {comment}\n")
 
-    def update_w_length(
+    def update_w_thinking(
         self, step: int, state: MonitorState, reason: str
     ) -> str | None:
         data = self.read()
-        old = float(data["training"]["r1_reward"]["w_length"])
+        r1_reward = data["training"]["r1_reward"]
+        old = float(r1_reward.get("w_thinking", r1_reward.get("w_length", 0.05)))
         new = max(old * 0.5, 0.01)
         if new == old:
             return None
-        action = f"w_length: {old:g} -> {new:g}"
+        action = f"w_thinking: {old:g} -> {new:g}"
         if not self.dry_run:
-            data["training"]["r1_reward"]["w_length"] = new
+            r1_reward["w_thinking"] = new
+            r1_reward.pop("w_length", None)
             self.write(data, step, f"step={step} | {action} | reason: {reason}")
-        state.config_change_log.append((step, "w_length", old, new))
+        state.config_change_log.append((step, "w_thinking", old, new))
         return action
+
+    def update_w_length(
+        self, step: int, state: MonitorState, reason: str
+    ) -> str | None:
+        """兼容旧接口，实际调整 w_thinking。"""
+        return self.update_w_thinking(step, state, reason)
 
     def update_learning_rate(
         self, step: int, state: MonitorState, reason: str

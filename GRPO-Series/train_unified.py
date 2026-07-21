@@ -1,19 +1,6 @@
-"""
-统一 GRPO 训练入口：多数据集 + LoRA + GSPO/PPO。
-
-支持数据集: countdown | dapo_math_17k | deepscaler
-支持训练模式: full | lora
-
-用法:
-    uv run python train_unified.py --config configs/train_unified.yaml
-    uv run python train_unified.py --config configs/train_unified.yaml --resume_lora_ckpt logs/<run>/ckpt_000100.pt
-"""
-
 import html
-import shutil
 import time
 from argparse import ArgumentParser
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -25,10 +12,13 @@ from torch.utils.tensorboard.writer import SummaryWriter
 
 from checkpoint import (
     add_resume_arguments,
-    build_lora_checkpoint_payload,
+    format_run_timestamp,
     load_lora_training_checkpoint,
     resolve_resume_paths,
+    save_run_config_snapshot,
+    save_training_checkpoint,
 )
+from competition_math_task import CompetitionMathDataset, reward_function as competition_math_reward
 from countdown_task import CountdownTasksDataset, reward_function as countdown_reward
 from dapo_math_task import DAPOMathDataset, reward_function as dapo_reward
 from deepscaler_task import DeepScalerDataset, reward_function as deepscaler_reward
@@ -73,8 +63,17 @@ def build_dataset_and_reward(config: dict[str, Any], tokenizer: Tokenizer, split
             test_size=dcfg["test_size"],
         )
         return dataset, DeepScalerDataset.collate_fn, deepscaler_reward
+    if dataset_name in ("competition_math", "math"):
+        dataset = CompetitionMathDataset(
+            tokenizer=tokenizer,
+            parquet_path=dcfg["competition_math_parquet_path"],
+            split=split,
+            test_size=dcfg["test_size"],
+        )
+        return dataset, CompetitionMathDataset.collate_fn, competition_math_reward
     raise ValueError(
-        "dataset.name must be one of countdown, dapo_math_17k, deepscaler. "
+        "dataset.name must be one of countdown, dapo_math_17k, deepscaler, "
+        "competition_math. "
         f"Got: {config['dataset']['name']}"
     )
 
@@ -144,15 +143,22 @@ def main(
         cli_resume_lora_ckpt=resume_lora_ckpt,
         cli_resume_log_dir=resume_log_dir,
     )
+    session_timestamp = format_run_timestamp()
     if resumed_log_dir is not None:
         run_log_dir = resumed_log_dir
-        print(f"Resuming into log dir: {run_log_dir}")
+        print(f"Resuming in-place into log dir: {run_log_dir}")
     else:
-        current_time = datetime.now().strftime(r"%Y%m%d-%H%M%S")
-        run_log_dir = Path(config["training"]["log_dir"]) / current_time
+        run_log_dir = Path(config["training"]["log_dir"]) / session_timestamp
+        if resume_ckpt_path is not None:
+            print(f"Resuming from checkpoint into new log dir: {run_log_dir}")
     run_log_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(config_path, run_log_dir / Path(config_path).name)
-    tb_writer = SummaryWriter(log_dir=str(run_log_dir))
+    config_snapshot_path = save_run_config_snapshot(
+        config_path,
+        run_log_dir,
+        session_timestamp,
+        resume_from_ckpt=resume_ckpt_path,
+    )
+    print(f"Saved config snapshot: {config_snapshot_path}")
 
     tokenizer = Tokenizer(str(pretrained_model_path / "tokenizer.json"))
     train_dataset, collate_fn, reward_function = build_dataset_and_reward(
@@ -211,6 +217,11 @@ def main(
             optimizer,
             use_lora=use_lora,
         )
+    tb_writer_kwargs: dict[str, Any] = {"log_dir": str(run_log_dir)}
+    if resumed_log_dir is not None and resumed_step > 0:
+        # Reusing one log dir across resumed sessions requires purging stale steps.
+        tb_writer_kwargs["purge_step"] = resumed_step + 1
+    tb_writer = SummaryWriter(**tb_writer_kwargs)
 
     # Each run keeps its own checkpoints under its log directory so that
     # parallel/sequential runs never overwrite each other's ckpt_<step>.pt.
@@ -234,7 +245,7 @@ def main(
     beta = float(config["training"].get("beta", 0.0))
     advantage_mode = str(config["training"].get("advantage_mode", "grpo")).lower()
     gspo_clip_len_scaling = str(
-        config["training"].get("gspo_clip_len_scaling", "linear")
+        config["training"].get("gspo_clip_len_scaling", "none")
     ).lower()
     print(
         "Sampling config: "
@@ -328,6 +339,10 @@ def main(
         num_responses = results.get("num_responses", 0.0)
         nonzero_adv_frac = results.get("nonzero_adv_frac", 1.0)
         num_zero_adv_groups = results.get("num_zero_adv_groups", 0.0)
+        group_reward_std_mean = results.get("group_reward_std_mean", 0.0)
+        kept_group_reward_std_mean = results.get("kept_group_reward_std_mean", 0.0)
+        group_below_threshold_frac = results.get("group_below_threshold_frac", 0.0)
+        advantage_std = results.get("advantage_std", 0.0)
         ppo_epochs_ran = results.get("ppo_epochs_ran", 0)
         num_target_tokens = results.get("num_target_tokens", 0.0)
         lr = optimizer.param_groups[0]["lr"]
@@ -342,6 +357,7 @@ def main(
             f"clip_frac: {clip_fraction:.3f}, approx_kl: {approx_kl:.4f}, "
             f"ppo_loss: {ppo_loss:.4f}, kl_loss: {kl_loss:.4f}, "
             f"ratio_mean: {ratio_mean:.3f}, nonzero_adv: {nonzero_adv_frac:.2f}, "
+            f"group_std: {group_reward_std_mean:.4f}, adv_std: {advantage_std:.3f}, "
             f"epochs: {ppo_epochs_ran}, tgt_toks: {num_target_tokens:.0f}, "
             f"responses: {num_responses:.0f}"
         )
@@ -378,6 +394,10 @@ def main(
         tb_writer.add_scalar("num_target_tokens", num_target_tokens, step)
         tb_writer.add_scalar("num_responses", num_responses, step)
         tb_writer.add_scalar("nonzero_adv_frac", nonzero_adv_frac, step)
+        tb_writer.add_scalar("group_reward_std_mean", group_reward_std_mean, step)
+        tb_writer.add_scalar("kept_group_reward_std_mean", kept_group_reward_std_mean, step)
+        tb_writer.add_scalar("group_below_threshold_frac", group_below_threshold_frac, step)
+        tb_writer.add_scalar("advantage_std", advantage_std, step)
         tb_writer.add_scalar("num_zero_adv_groups", num_zero_adv_groups, step)
         tb_writer.add_scalar("ppo_epochs_ran", ppo_epochs_ran, step)
         for i, ep in enumerate(episodes[:4]):
@@ -385,18 +405,15 @@ def main(
             tb_writer.add_text(f"text_{i}", f"<pre>{text}</pre>", step)
 
         if step % config["training"]["ckpt_save_interval"] == 0:
-            output_file = ckpt_dir / f"ckpt_{step:06d}.pt"
-            if use_lora:
-                checkpoint = build_lora_checkpoint_payload(
-                    step,
-                    model,
-                    optimizer,
-                    base_model_path=pretrained_model_path,
-                    lora_config=lora_cfg,
-                )
-                torch.save(checkpoint, output_file)
-            else:
-                torch.save(model.state_dict(), output_file)
+            output_file = save_training_checkpoint(
+                ckpt_dir,
+                step,
+                use_lora=use_lora,
+                model=model,
+                optimizer=optimizer,
+                base_model_path=pretrained_model_path if use_lora else None,
+                lora_config=lora_cfg if use_lora else None,
+            )
             print(f"Saved checkpoint to {output_file}")
 
 

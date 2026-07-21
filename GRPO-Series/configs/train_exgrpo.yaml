@@ -1,0 +1,96 @@
+# ExGRPO + GSPO 训练配置（Qwen2.5-3B-Instruct）
+# 用法: uv run python train_exgrpo.py --config configs/train_exgrpo.yaml
+#
+# 方法说明见 docs/training.md / docs/training_zh-CN.md
+# 论文: ExGRPO (arXiv:2510.02245), GSPO (arXiv:2507.18071)
+
+model:
+  preset: "qwen2.5-3b-instruct"
+  pretrained_model_path: "models/Qwen2.5-3B-Instruct"
+  device: "cuda"
+  dtype: "bfloat16"
+
+dataset:
+  # countdown | dapo_math_17k | deepscaler | competition_math
+  name: "deepscaler"
+  countdown_path: "data/Countdown-Tasks-3to4"
+  dapo_parquet_path: "data/DAPO-Math-17k/data/dapo-math-17k.parquet"
+  deepscaler_json_path: "data/deepscaler/deepscaler.json"
+  competition_math_parquet_path: "data/competition_math/data/train-00000-of-00001.parquet"
+  test_size: 256
+
+training:
+  mode: "lora"
+  random_seed: 1337
+  max_prompt_len: 1024
+  max_gen_len: 3072
+
+  sampling:
+    do_sample: true
+    temperature: 1.0
+    top_p: 1.0
+    top_k: 0
+
+  # accuracy + format（无 thinking 长度奖励）
+  reward:
+    w_accuracy: 1.0
+    w_format: 0.2
+    accuracy_mode: signed
+    partial_format_credit: false
+
+  # GSPO 序列级 ratio + PPO 裁剪
+  # GSPO 论文 clip 约为 3e-4 / 4e-4（ratio 空间，远小于 token-level GRPO 的 0.2）
+  use_ppo_clip: true
+  advantage_mode: "gspo"
+  gspo_clip_len_scaling: "none"
+  beta: 0.0
+  clip_ratio_low: 3.0e-4
+  clip_ratio_high: 4.0e-4
+  ppo_epochs: 2
+
+  center_advantages: true
+  scale_advantages_by_std: false
+  advantage_std_epsilon: 1.0e-4
+  advantage_std_threshold: 1.0e-4
+  drop_zero_adv_groups: true
+  adv_zero_drop_replenish: false
+  adv_zero_drop_max_rounds: 4
+
+  # batch_size = num_questions_per_batch × K
+  batch_size: 512
+  num_questions_per_batch: 64
+  rollout_chunk_size: 512
+  micro_batch_size: 8
+
+  max_grad_norm: 1.1
+  learning_rate: 1.0e-5
+  weight_decay: 0.1
+  betas: [0.9, 0.99]
+  memory_efficient_adamw: false
+
+  lora:
+    r: 32
+    alpha: 64
+    dropout: 0.0
+    target_modules: ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+
+  log_dir: "logs"
+  resume_lora_ckpt: null
+  resume_log_dir: null
+  skip_unfinished_episodes: true
+  ckpt_save_interval: 10
+  eval_interval: 10
+  tb_verbose_metrics: false
+  tb_text_samples: 0
+
+  # ExGRPO 经验回放（arXiv:2510.02245）
+  # 延迟启动: Pass@1 ≥ activation_threshold 后才混入 replay
+  exgrpo:
+    enabled: true
+    rho: 0.5
+    beta: 0.1
+    mix_acc_threshold: 0.35
+    mu: 0.5
+    sigma: 1.0
+    activation_threshold: 0.35
+    K: 8

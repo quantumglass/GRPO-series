@@ -2,27 +2,54 @@
 
 from __future__ import annotations
 
-import math
 from typing import Any
 
 
-def pass_at_k_unbiased(num_samples: int, num_correct: int, k: int) -> float:
+def pass_at_k_simple(sample_correct: list[bool], k: int) -> float:
     """
-    Unbiased pass@k estimator (Chen et al., HumanEval).
+    Simple pass@k: 1.0 if at least one of the first k rollouts is correct.
 
-    num_samples: total independent samples n for one problem
-    num_correct: how many of those samples are correct (c)
-    k: pass@k cutoff
+    sample_correct: per-rollout correctness for one question (length = num_samples)
+    k: pass@k cutoff (uses the first k rollouts)
     """
     if k <= 0:
         return 0.0
-    if num_correct <= 0:
-        return 0.0
-    if num_samples - num_correct < k:
-        return 1.0
-    if k > num_samples:
-        return 0.0
-    return 1.0 - math.comb(num_samples - num_correct, k) / math.comb(num_samples, k)
+    return 1.0 if any(sample_correct[:k]) else 0.0
+
+
+def is_pass_at_k_solved(sample_correct: list[bool], k: int) -> bool:
+    """True when at least one of the first k rollouts is correct."""
+    return pass_at_k_simple(sample_correct, k) > 0.0
+
+
+def is_benchmark_enabled(eval_cfg: dict[str, Any], benchmark_name: str) -> bool:
+    """Whether a benchmark should run, controlled by benchmark_overrides.<name>.enabled."""
+    override_cfg = (eval_cfg.get("benchmark_overrides") or {}).get(benchmark_name, {}) or {}
+    if not override_cfg:
+        return True
+    return bool(override_cfg.get("enabled", True))
+
+
+def resolve_eval_benchmarks(
+    benchmarks: dict[str, Any],
+    eval_cfg: dict[str, Any],
+) -> list[tuple[str, dict[str, Any]]]:
+    """Return enabled (name, cfg) pairs; skip those with enabled: false in benchmark_overrides."""
+    enabled: list[tuple[str, dict[str, Any]]] = []
+    skipped: list[str] = []
+    for name, cfg in benchmarks.items():
+        if is_benchmark_enabled(eval_cfg, name):
+            enabled.append((name, cfg))
+        else:
+            skipped.append(name)
+    if skipped:
+        print(f"Skipping disabled benchmarks: {', '.join(skipped)}")
+    if not enabled:
+        raise ValueError(
+            "No benchmarks enabled for evaluation. "
+            "Set benchmark_overrides.<name>.enabled: true for at least one dataset."
+        )
+    return enabled
 
 
 def resolve_pass_at_k_config(
@@ -63,51 +90,80 @@ def resolve_pass_at_k_config(
     return pass_at_k, num_samples
 
 
-def compute_pass_at_k_from_counts(
-    correct_counts: list[int],
-    num_samples: int,
+def compute_pass_at_k_from_samples(
+    sample_results: list[list[bool]],
     pass_at_k: list[int],
+    num_samples: int,
 ) -> dict[str, dict[str, float | int]]:
-    """Aggregate per-question correct-counts into pass@k metrics."""
-    total = len(correct_counts)
+    """
+    Aggregate per-question rollout results into simple pass@k metrics.
+
+    For each k, a question passes if at least one of its first k rollouts is correct.
+    """
+    total = len(sample_results)
     metrics: dict[str, dict[str, float | int]] = {}
     for k in pass_at_k:
-        passed = 0
-        rate_sum = 0.0
-        for c in correct_counts:
-            rate = pass_at_k_unbiased(num_samples, c, k)
-            rate_sum += rate
-            if rate >= 1.0 - 1e-12:
-                passed += 1
+        passed = sum(1 for s in sample_results if is_pass_at_k_solved(s, k))
         metrics[str(k)] = {
-            "rate": rate_sum / total if total else 0.0,
+            "rate": passed / total if total else 0.0,
             "passed": passed,
+            "total": total,
+        }
+    if num_samples > 1:
+        any_correct = sum(1 for s in sample_results if is_pass_at_k_solved(s, num_samples))
+        metrics["_meta"] = {
+            "num_samples": num_samples,
+            "any_correct": any_correct,
             "total": total,
         }
     return metrics
 
 
+def resolve_accuracy_fields(
+    *,
+    sample_results: list[list[bool]],
+    num_samples: int,
+    first_sample_correct: list[bool] | None,
+) -> tuple[float, int]:
+    """
+    Return (accuracy, correct_count).
+
+    num_samples == 1: plain accuracy (the single sample).
+    num_samples > 1: first-sample accuracy when first_sample_correct is provided;
+      otherwise derive from the first rollout in sample_results.
+    """
+    total = len(sample_results)
+    if total == 0:
+        return 0.0, 0
+    if num_samples == 1:
+        correct = sum(1 for s in sample_results if s and s[0])
+        return correct / total, correct
+    if first_sample_correct is not None:
+        correct = sum(1 for ok in first_sample_correct if ok)
+        return correct / total, correct
+    correct = sum(1 for s in sample_results if s and s[0])
+    return correct / total, correct
+
+
 def build_benchmark_result(
     *,
-    correct_counts: list[int],
+    sample_results: list[list[bool]],
     num_samples: int,
     pass_at_k: list[int],
+    first_sample_correct: list[bool] | None = None,
 ) -> dict[str, Any]:
-    """Build result dict with legacy accuracy fields plus pass@k block."""
-    total = len(correct_counts)
-    pass_metrics = compute_pass_at_k_from_counts(correct_counts, num_samples, pass_at_k)
-    pass_at_1 = pass_metrics.get("1", {}).get("rate", 0.0)
-    correct_at_1 = sum(1 for c in correct_counts if c > 0) if num_samples == 1 else int(
-        round(pass_at_1 * total)
+    """Build result dict with first-sample accuracy plus pass@k block."""
+    total = len(sample_results)
+    pass_metrics = compute_pass_at_k_from_samples(sample_results, pass_at_k, num_samples)
+    accuracy, correct = resolve_accuracy_fields(
+        sample_results=sample_results,
+        num_samples=num_samples,
+        first_sample_correct=first_sample_correct,
     )
 
-    # When num_samples==1, pass@1 equals plain accuracy.
-    if num_samples == 1:
-        correct_at_1 = sum(1 for c in correct_counts if c > 0)
-
     result: dict[str, Any] = {
-        "accuracy": pass_metrics["1"]["rate"] if "1" in pass_metrics else (correct_at_1 / total if total else 0.0),
-        "correct": correct_at_1,
+        "accuracy": accuracy,
+        "correct": correct,
         "total": total,
         "num_samples": num_samples,
         "pass_at_k": pass_metrics,
@@ -115,11 +171,28 @@ def build_benchmark_result(
     return result
 
 
-def format_pass_at_k_summary(pass_at_k: dict[str, dict[str, float | int]]) -> str:
+def format_pass_at_k_summary(
+    pass_at_k: dict[str, dict[str, float | int]],
+    *,
+    num_samples: int = 1,
+) -> str:
+    """
+    Format pass@k lines for logging.
+
+    Simple pass@k: for each k, rate = fraction of questions with at least one
+    correct among the first k rollouts.
+    """
+    meta = pass_at_k.get("_meta", {})
     parts = []
-    for k in sorted(pass_at_k.keys(), key=lambda x: int(x)):
+    for k in sorted(
+        (key for key in pass_at_k.keys() if not str(key).startswith("_")),
+        key=lambda x: int(x),
+    ):
         item = pass_at_k[k]
-        parts.append(
-            f"pass@{k}={item['rate']:.4f} ({item['passed']}/{item['total']})"
-        )
+        rate = float(item["rate"])
+        passed = int(item["passed"])
+        total = int(item["total"])
+        parts.append(f"pass@{k}={rate:.4f} ({passed}/{total})")
+    if num_samples > 1 and meta:
+        parts.append(f"[n={int(meta['num_samples'])} samples/q]")
     return ", ".join(parts)

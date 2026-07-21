@@ -2,7 +2,7 @@
 
 **English** | [简体中文](evaluation_zh-CN.md)
 
-How to run benchmark evaluation and debug score anomalies.
+How to run benchmark evaluation and debug score anomalies. For training algorithms and hyperparameters, see [training.md](training.md).
 
 ## 1. Environment
 
@@ -12,6 +12,8 @@ uv sync
 
 - `evaluate_models.py` — native model stack (`qwen2_model.py` + `tokenizer.py`)
 - `evaluate_models_readme.py` — `transformers` API (aligned with Qwen official README)
+- `evaluate_models_r1_thinking.py` — R1 thinking-format evaluation
+- `evaluate_models_math7b.py` — Qwen2.5-Math-7B base evaluation
 
 ## 2. Data integrity check
 

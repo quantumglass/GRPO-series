@@ -1,9 +1,4 @@
-"""
-DeepScaleR 数学数据集加载与奖励函数。
-
-数据格式见 agentica-org/DeepScaleR-Preview-Dataset。
-奖励 = format_reward (0.1) + answer_reward (0/1)，答案匹配支持 LaTeX 与分数归一化。
-"""
+# deepscaler_task.py
 
 import json
 import re
@@ -153,7 +148,7 @@ def extract_answer(response: str) -> Optional[str]:
     DeepScaleR 的答案可能包含分数、根号、LaTeX 等非整数形式。
     提取策略：
       1. 优先匹配 <answer>...</answer> 标签
-      2. 回退匹配 \\boxed{...}（竞赛数学常见格式）
+      2. 回退匹配 \\boxed{...}（竞赛数学常见格式，支持嵌套花括号）
       3. 不做过度宽松的兜底，避免引入噪声
     """
     # 第 1 层：<answer>...</answer> 标签
@@ -161,10 +156,12 @@ def extract_answer(response: str) -> Optional[str]:
     if tag_match:
         return tag_match.group(1).strip()
 
-    # 第 2 层：\boxed{...}（模型可能自发输出的竞赛格式）
-    boxed_match = re.search(r"\\boxed\{([^}]*)\}", response)
-    if boxed_match:
-        return boxed_match.group(1).strip()
+    # 第 2 层：\boxed{...}（延迟导入避免与 benchmark_task 循环依赖）
+    from benchmark_task import extract_boxed_answer
+
+    boxed = extract_boxed_answer(response)
+    if boxed is not None:
+        return boxed.strip()
 
     return None
 

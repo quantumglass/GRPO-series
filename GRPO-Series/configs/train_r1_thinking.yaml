@@ -1,4 +1,4 @@
-# R1 风格长思考训练：复合奖励（准确率 + 格式 + 长度）
+# R1 风格长思考 + ExGRPO（可选）
 # 用法: uv run python train_r1_thinking.py --config configs/train_r1_thinking.yaml
 
 model:
@@ -11,49 +11,57 @@ dataset:
   countdown_path: "data/Countdown-Tasks-3to4"
   dapo_parquet_path: "data/DAPO-Math-17k/data/dapo-math-17k.parquet"
   deepscaler_json_path: "data/deepscaler/deepscaler.json"
+  competition_math_parquet_path: "data/competition_math/data/train-00000-of-00001.parquet"
   test_size: 256
 
 training:
   mode: "lora"
   random_seed: 1337
   max_prompt_len: 1024
-  max_gen_len: 1536
+  max_gen_len: 2048
 
   sampling:
     do_sample: true
-    temperature: 1.1
+    temperature: 1.0
     top_p: 1.0
     top_k: 0
 
+  # total = w_thinking·thinking + w_accuracy·acc + w_format·format
   r1_reward:
+    w_thinking: -0.1
     w_accuracy: 1.0
-    w_format: 0.2
-    w_length: 0.05
-    min_thinking_chars: 120
-    target_thinking_chars: 2048
+    w_format: 0.1
+    accuracy_mode: signed
+    min_thinking_chars: 2048
+    target_thinking_chars: 10240
     partial_format_credit: false
 
   use_ppo_clip: true
   advantage_mode: "grpo"
   gspo_clip_len_scaling: "none"
-  beta: 0.02
+  beta: 0.0
   clip_ratio_low: 0.2
-  clip_ratio_high: 0.32
-  ppo_epochs: 3
-  advantage_std_threshold: 1.0e-4
-  center_advantages: true
-  scale_advantages_by_std: true
-  advantage_std_epsilon: 1.0e-4
-  drop_zero_adv_groups: true
+  clip_ratio_high: 0.28
+  ppo_epochs: 2
 
-  batch_size: 768
-  num_questions_per_batch: 48
-  rollout_chunk_size: 768
-  micro_batch_size: 3
-  max_grad_norm: 0.9
-  learning_rate: 2.0e-5
+  center_advantages: true
+  scale_advantages_by_std: false
+  advantage_std_epsilon: 1.0e-4
+  advantage_std_threshold: 1.0e-4
+  drop_zero_adv_groups: false
+  adv_zero_drop_replenish: false
+  adv_zero_drop_max_rounds: 4
+
+  batch_size: 512
+  num_questions_per_batch: 64
+  rollout_chunk_size: 512
+  micro_batch_size: 4
+
+  max_grad_norm: 1.1
+  learning_rate: 1.0e-5
   weight_decay: 0.1
   betas: [0.9, 0.99]
+  memory_efficient_adamw: false
 
   lora:
     r: 32
@@ -64,7 +72,18 @@ training:
   log_dir: "logs"
   resume_lora_ckpt: null
   resume_log_dir: null
-  skip_unfinished_episodes: false
+  skip_unfinished_episodes: true
   ckpt_save_interval: 10
   eval_interval: 10
-  memory_efficient_adamw: false
+  tb_verbose_metrics: false
+  tb_text_samples: 0
+
+  exgrpo:
+    enabled: true
+    rho: 0.5
+    beta: 0.1
+    mix_acc_threshold: 0.35
+    mu: 0.5
+    sigma: 1.0
+    activation_threshold: 0.35
+    K: 8

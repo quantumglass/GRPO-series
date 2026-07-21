@@ -2,7 +2,7 @@
 
 [English](evaluation.md) | **简体中文**
 
-本文档说明如何运行基准评测并排查分数异常。
+本文档说明如何运行基准评测并排查分数异常。训练算法与超参见 [training_zh-CN.md](training_zh-CN.md)。
 
 ## 1. 环境与依赖
 
@@ -12,6 +12,8 @@ uv sync
 
 - `evaluate_models.py` — 使用项目自研模型栈（`qwen2_model.py` + `tokenizer.py`）
 - `evaluate_models_readme.py` — 使用 `transformers` 口径（对齐 Qwen 官方 README）
+- `evaluate_models_r1_thinking.py` — R1 thinking 格式评测
+- `evaluate_models_math7b.py` — Qwen2.5-Math-7B base 评测
 
 ## 2. 数据集完整性检查
 

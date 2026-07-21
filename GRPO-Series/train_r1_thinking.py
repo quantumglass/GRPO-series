@@ -10,10 +10,9 @@
 
 import dataclasses
 import html
-import shutil
+import math
 import time
 from argparse import ArgumentParser
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -26,14 +25,29 @@ from torch.utils.tensorboard.writer import SummaryWriter
 from benchmark_task import answer_matches, extract_pred_answer
 from checkpoint import (
     add_resume_arguments,
-    build_lora_checkpoint_payload,
+    format_run_timestamp,
     load_lora_training_checkpoint,
     resolve_resume_paths,
+    save_run_config_snapshot,
+    save_training_checkpoint,
 )
+from competition_math_task import CompetitionMathDataset
 from countdown_task import CountdownTasksDataset
 from dapo_math_task import DAPOMathDataset
 from deepscaler_task import DeepScalerDataset
-from grpo import update_policy
+from grpo import (
+    adv_zero_drop_replenish_config_from_dict,
+    collect_episodes_with_adv_zero_drop_replenish,
+    update_policy,
+)
+from exgrpo import (
+    ExGRPOConfig,
+    ExGRPOManager,
+    compute_pass_at_1,
+    format_exgrpo_storage_summary,
+    merge_replay_and_fresh_rollouts,
+    question_id_from_prefix,
+)
 from grpo_efficient import rollout_chunked
 from lora import (
     LoRAConfig,
@@ -44,7 +58,11 @@ from lora import (
 )
 from optimizer import MemoryEfficientAdamW
 from qwen2_model import Transformer
-from r1_thinking_reward import build_r1_reward_function, r1_reward_config_from_dict
+from r1_thinking_reward import (
+    build_r1_reward_function,
+    is_accuracy_correct,
+    r1_reward_config_from_dict,
+)
 from sampling import sampling_config_from_dict
 from tokenizer import Tokenizer
 
@@ -83,8 +101,17 @@ def build_dataset_and_collate(config: dict[str, Any], tokenizer: Tokenizer, spli
             test_size=dcfg["test_size"],
         )
         return dataset, DeepScalerDataset.collate_fn, "math"
+    if dataset_name in ("competition_math", "math"):
+        dataset = CompetitionMathDataset(
+            tokenizer=tokenizer,
+            parquet_path=dcfg["competition_math_parquet_path"],
+            split=split,
+            test_size=dcfg["test_size"],
+        )
+        return dataset, CompetitionMathDataset.collate_fn, "math"
     raise ValueError(
-        "dataset.name must be one of countdown, dapo_math_17k, deepscaler. "
+        "dataset.name must be one of countdown, dapo_math_17k, deepscaler, "
+        "competition_math. "
         f"Got: {config['dataset']['name']}"
     )
 
@@ -194,6 +221,118 @@ def evaluate_accuracy(
     return float(np.mean(correct)) if correct else 0.0
 
 
+def _next_train_batch_optional(dataloader_iter):
+    try:
+        return next(dataloader_iter), dataloader_iter, False
+    except StopIteration:
+        return None, dataloader_iter, True
+
+
+def _slice_batch_by_indices(batch: Any, question_indices: list[int]) -> Any:
+    """Keep selected questions from a collated batch."""
+    if not question_indices:
+        raise ValueError("question_indices must be non-empty")
+    if len(question_indices) >= len(batch.prefix):
+        return batch
+    ordered_indices = sorted(question_indices)
+    fields: dict[str, Any] = {}
+    for key in dataclasses.fields(batch):
+        value = getattr(batch, key.name)
+        if isinstance(value, list):
+            fields[key.name] = [value[i] for i in ordered_indices]
+        else:
+            fields[key.name] = value
+    return dataclasses.replace(batch, **fields)
+
+
+def _build_batch_from_dataset_indices(
+    dataset,
+    collate_fn: Callable,
+    indices: list[int],
+):
+    samples = [dataset[i] for i in indices]
+    return collate_fn(samples)
+
+
+def _sample_indices_by_acc_gaussian(
+    *,
+    dataset_size: int,
+    batch_size: int,
+    index_to_qid: dict[int, str],
+    acc_tracker: dict[str, float],
+    mu: float,
+    sigma: float,
+    rng: np.random.Generator,
+) -> list[int]:
+    if dataset_size <= 0 or batch_size <= 0:
+        return []
+    all_indices = np.arange(dataset_size, dtype=np.int64)
+    weights = np.ones(dataset_size, dtype=np.float64)
+    scale = max(sigma, 1e-8)
+    for i in range(dataset_size):
+        q_id = index_to_qid.get(i)
+        acc = float(acc_tracker.get(q_id, 0.0)) if q_id is not None else 0.0
+        z = (acc - mu) / scale
+        weights[i] = math.exp(-0.5 * z * z)
+    total = float(weights.sum())
+    probs = np.ones_like(weights) / len(weights) if total <= 0 else weights / total
+    pick_n = min(batch_size, dataset_size)
+    chosen = rng.choice(all_indices, size=pick_n, replace=False, p=probs).tolist()
+    chosen.sort()
+    return chosen
+
+
+def _rollout_batch(
+    batch,
+    *,
+    model,
+    tokenizer,
+    dataset_kind,
+    max_gen_len,
+    num_answers_per_question,
+    reward_function,
+    device,
+    dtype,
+    sampling,
+    rollout_chunk_size,
+    skip_unfinished_episodes,
+    rewrite_prefix: bool = True,
+):
+    if rewrite_prefix:
+        batch = rewrite_batch_with_r1_prefix(
+            batch, tokenizer=tokenizer, dataset_kind=dataset_kind
+        )
+    episodes = rollout_chunked(
+        model=model,
+        tokenizer=tokenizer,
+        batch=batch,
+        max_gen_len=max_gen_len,
+        num_answer_per_question=num_answers_per_question,
+        reward_function=reward_function,
+        device=device,
+        dtype=dtype,
+        sampling=sampling,
+        rollout_chunk_size=rollout_chunk_size,
+    )
+    if skip_unfinished_episodes:
+        episodes = [ep for ep in episodes if ep.is_finished]
+    return episodes
+
+
+def _episode_accuracy_value(ep) -> float:
+    return float(ep.reward_info.get("accuracy_reward", ep.reward_info.get("answer_reward", 0.0)))
+
+
+def _success_rate_from_episodes(episodes: list) -> float | None:
+    if not episodes:
+        return None
+    return float(np.mean([is_accuracy_correct(_episode_accuracy_value(ep)) for ep in episodes]))
+
+
+def _fmt_optional_metric(value: float | None) -> str:
+    return "na" if value is None else f"{value:.3f}"
+
+
 def main(
     config_path: str,
     resume_lora_ckpt: str | None = None,
@@ -222,15 +361,22 @@ def main(
         cli_resume_lora_ckpt=resume_lora_ckpt,
         cli_resume_log_dir=resume_log_dir,
     )
+    session_timestamp = format_run_timestamp()
     if resumed_log_dir is not None:
         run_log_dir = resumed_log_dir
-        print(f"Resuming into log dir: {run_log_dir}")
+        print(f"Resuming in-place into log dir: {run_log_dir}")
     else:
-        current_time = datetime.now().strftime(r"%Y%m%d-%H%M%S")
-        run_log_dir = Path(config["training"]["log_dir"]) / f"{current_time}-r1-thinking"
+        run_log_dir = Path(config["training"]["log_dir"]) / f"{session_timestamp}-r1-thinking"
+        if resume_ckpt_path is not None:
+            print(f"Resuming from checkpoint into new log dir: {run_log_dir}")
     run_log_dir.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(config_path, run_log_dir / Path(config_path).name)
-    tb_writer = SummaryWriter(log_dir=str(run_log_dir))
+    config_snapshot_path = save_run_config_snapshot(
+        config_path,
+        run_log_dir,
+        session_timestamp,
+        resume_from_ckpt=resume_ckpt_path,
+    )
+    print(f"Saved config snapshot: {config_snapshot_path}")
 
     tokenizer = Tokenizer(str(pretrained_model_path / "tokenizer.json"))
     train_dataset, collate_fn, dataset_kind = build_dataset_and_collate(
@@ -238,13 +384,7 @@ def main(
     )
     r1_cfg = r1_reward_config_from_dict(config["training"].get("r1_reward"))
     reward_function = build_r1_reward_function(dataset_kind=dataset_kind, cfg=r1_cfg)
-    train_dataloader = DataLoader(
-        train_dataset,
-        shuffle=True,
-        collate_fn=collate_fn,
-        generator=torch.Generator(device=device),
-        batch_size=num_questions_per_batch,
-    )
+    train_dataset_size = len(train_dataset)
 
     model = Transformer.from_pretrained(pretrained_model_path, device=device).train()
     mode = config["training"]["mode"].lower()
@@ -283,6 +423,9 @@ def main(
         enabled=config["training"]["memory_efficient_adamw"],
     )
 
+    exgrpo_cfg = ExGRPOConfig.from_dict(config["training"].get("exgrpo"))
+    exgrpo_mgr = ExGRPOManager(exgrpo_cfg)
+
     resumed_step = 0
     if resume_ckpt_path is not None:
         resumed_step = load_lora_training_checkpoint(
@@ -290,7 +433,15 @@ def main(
             model,
             optimizer,
             use_lora=use_lora,
+            exgrpo_manager=exgrpo_mgr if exgrpo_cfg.enabled else None,
         )
+        if exgrpo_cfg.enabled and resume_ckpt_path is not None:
+            print(format_exgrpo_storage_summary(manager=exgrpo_mgr))
+    tb_writer_kwargs: dict[str, Any] = {"log_dir": str(run_log_dir)}
+    if resumed_log_dir is not None and resumed_step > 0:
+        # Reusing one log dir across resumed sessions requires purging stale steps.
+        tb_writer_kwargs["purge_step"] = resumed_step + 1
+    tb_writer = SummaryWriter(**tb_writer_kwargs)
 
     ckpt_dir = run_log_dir
     sampling = sampling_config_from_dict(config["training"].get("sampling"))
@@ -305,44 +456,271 @@ def main(
     scale_advantages_by_std = bool(config["training"].get("scale_advantages_by_std", True))
     advantage_std_epsilon = float(config["training"].get("advantage_std_epsilon", 1e-4))
     drop_zero_adv_groups = bool(config["training"].get("drop_zero_adv_groups", True))
+    adv_zero_drop_cfg = adv_zero_drop_replenish_config_from_dict(
+        config["training"],
+        default_batch_size=batch_size,
+    )
+    tb_verbose_metrics = bool(config["training"].get("tb_verbose_metrics", False))
+    tb_text_samples_default = 4 if tb_verbose_metrics else 0
+    tb_text_samples = max(
+        0, int(config["training"].get("tb_text_samples", tb_text_samples_default))
+    )
     beta = float(config["training"].get("beta", 0.0))
     advantage_mode = str(config["training"].get("advantage_mode", "grpo")).lower()
-    gspo_clip_len_scaling = str(config["training"].get("gspo_clip_len_scaling", "linear")).lower()
+    gspo_clip_len_scaling = str(config["training"].get("gspo_clip_len_scaling", "none")).lower()
 
     print(
         "R1 thinking reward: "
-        f"w_acc={r1_cfg.w_accuracy}, w_fmt={r1_cfg.w_format}, w_len={r1_cfg.w_length}, "
+        f"w_thinking={r1_cfg.w_thinking}, w_acc={r1_cfg.w_accuracy}, "
+        f"w_fmt={r1_cfg.w_format}, acc_mode={r1_cfg.accuracy_mode}, "
         f"target_chars={r1_cfg.target_thinking_chars}"
     )
     print(f"Rollout chunk size: {rollout_chunk_size}")
     print(f"max_gen_len: {config['training']['max_gen_len']}")
+    if adv_zero_drop_cfg.enabled:
+        print(
+            "Adv-zero-drop replenish: "
+            f"target_batch_size={adv_zero_drop_cfg.target_batch_size}, "
+            f"max_rounds={adv_zero_drop_cfg.max_rounds}"
+        )
+    if exgrpo_cfg.enabled:
+        print(
+            "ExGRPO enabled: "
+            f"rho={exgrpo_cfg.rho}, beta={exgrpo_cfg.beta}, K={exgrpo_cfg.K}, "
+            f"activation_threshold={exgrpo_cfg.activation_threshold}, "
+            f"mix_acc_threshold={exgrpo_cfg.mix_acc_threshold}, "
+            f"mu={exgrpo_cfg.mu}, sigma={exgrpo_cfg.sigma}"
+        )
+    print(
+        "TensorBoard logging: "
+        f"verbose_metrics={tb_verbose_metrics}, text_samples={tb_text_samples}"
+    )
     print(f"Checkpoints will be saved under: {ckpt_dir}")
     start_time = time.time()
+    skip_unfinished_episodes = bool(config["training"]["skip_unfinished_episodes"])
+    batches_per_epoch = max(
+        int(math.ceil(train_dataset_size / max(num_questions_per_batch, 1))), 1
+    )
+    consumed_batches = 0
+    sequential_cursor = 0
+    index_to_qid: dict[int, str] = {}
+    switched_to_acc_sampling = False
 
-    for local_step, batch in enumerate(train_dataloader, start=1):
+    def has_full_acc_coverage() -> bool:
+        if len(index_to_qid) < train_dataset_size:
+            return False
+        return all(
+            q_id in exgrpo_mgr.buffer.acc_tracker for q_id in index_to_qid.values()
+        )
+
+    def fetch_next_batch() -> tuple[Any | None, list[int], bool]:
+        nonlocal consumed_batches, sequential_cursor, switched_to_acc_sampling
+        if consumed_batches >= batches_per_epoch:
+            return None, [], True
+        if has_full_acc_coverage():
+            if not switched_to_acc_sampling:
+                switched_to_acc_sampling = True
+                print("Batch sampling switched to acc-gaussian mode.")
+            indices = _sample_indices_by_acc_gaussian(
+                dataset_size=train_dataset_size,
+                batch_size=num_questions_per_batch,
+                index_to_qid=index_to_qid,
+                acc_tracker=exgrpo_mgr.buffer.acc_tracker,
+                mu=exgrpo_cfg.mu,
+                sigma=exgrpo_cfg.sigma,
+                rng=exgrpo_mgr.buffer.rng,
+            )
+        else:
+            start = sequential_cursor
+            end = min(start + num_questions_per_batch, train_dataset_size)
+            if end <= start:
+                return None, [], True
+            indices = list(range(start, end))
+            sequential_cursor = end
+        if not indices:
+            return None, [], True
+        batch = _build_batch_from_dataset_indices(train_dataset, collate_fn, indices)
+        consumed_batches += 1
+        return batch, indices, False
+
+    local_step = 0
+
+    while True:
+        batch, batch_indices, exhausted = fetch_next_batch()
+        if exhausted:
+            break
+        local_step += 1
         step = resumed_step + local_step
-        batch = rewrite_batch_with_r1_prefix(batch, tokenizer=tokenizer, dataset_kind=dataset_kind)
-        episodes = rollout_chunked(
+        rollout_kwargs = dict(
             model=model,
             tokenizer=tokenizer,
-            batch=batch,
+            dataset_kind=dataset_kind,
             max_gen_len=config["training"]["max_gen_len"],
-            num_answer_per_question=num_answers_per_question,
             reward_function=reward_function,
             device=device,
             dtype=dtype,
             sampling=sampling,
             rollout_chunk_size=rollout_chunk_size,
+            skip_unfinished_episodes=skip_unfinished_episodes,
         )
+        rollout_batch = rewrite_batch_with_r1_prefix(
+            batch, tokenizer=tokenizer, dataset_kind=dataset_kind
+        )
+        for idx, prefix in zip(batch_indices, rollout_batch.prefix):
+            index_to_qid[idx] = question_id_from_prefix(prefix)
+        exgrpo_k = exgrpo_cfg.K if exgrpo_cfg.enabled else num_answers_per_question
+        current_batch_questions = len(rollout_batch.prefix)
+        n_exp_target, _ = exgrpo_mgr.build_mixed_batch_plan(current_batch_questions)
+        episodes: list = []
+        exgrpo_stats: dict[str, float] = {
+            "exgrpo_n_exp_target": float(n_exp_target),
+            "exgrpo_n_exp_candidate": 0.0,
+            "exgrpo_n_exp": 0.0,
+            "exgrpo_n_on": float(current_batch_questions),
+            "exgrpo_buffer_size": float(len(exgrpo_mgr.buffer)),
+            "exgrpo_activated": float(exgrpo_mgr.activated),
+        }
+        if exgrpo_cfg.enabled and rollout_batch is not None:
+            exgrpo_mgr.enrich_meta_from_batch(rollout_batch)
+
+        if exgrpo_mgr.activated and rollout_batch is not None:
+            # Current-batch full gating: every question is examined for replay mixing.
+            exgrpo_stats["exgrpo_n_exp_candidate"] = float(len(rollout_batch.prefix))
+
+            mix_pairs: list[tuple[int, str]] = []
+            mix_qids: list[str] = []
+            on_indices: list[int] = []
+            for idx, prefix in enumerate(rollout_batch.prefix):
+                q_id = question_id_from_prefix(prefix)
+                hist_acc = float(exgrpo_mgr.buffer.acc_tracker.get(q_id, 0.0))
+                has_replay = q_id in exgrpo_mgr.buffer.buffer and bool(
+                    exgrpo_mgr.buffer.buffer[q_id]
+                )
+                if hist_acc >= exgrpo_cfg.mix_acc_threshold and has_replay:
+                    mix_pairs.append((idx, q_id))
+                    mix_qids.append(q_id)
+                else:
+                    on_indices.append(idx)
+            replay_lookup = exgrpo_mgr.build_replay_for_question_ids(
+                mix_qids,
+                model,
+                device=device,
+                dtype=dtype,
+                pad_token_id=tokenizer.pad_token_id,
+            )
+            final_mix_pairs: list[tuple[int, str]] = []
+            for idx, q_id in mix_pairs:
+                if q_id in replay_lookup:
+                    final_mix_pairs.append((idx, q_id))
+                else:
+                    on_indices.append(idx)
+
+            # 3) Non-mixed questions run pure on-policy K rollouts.
+            on_indices = sorted(set(on_indices))
+            exgrpo_stats["exgrpo_n_exp"] = float(len(final_mix_pairs))
+            exgrpo_stats["exgrpo_n_on"] = float(len(on_indices))
+            if on_indices:
+                on_batch = _slice_batch_by_indices(rollout_batch, on_indices)
+                on_episodes = _rollout_batch(
+                    on_batch,
+                    num_answers_per_question=exgrpo_k,
+                    rewrite_prefix=False,
+                    **rollout_kwargs,
+                )
+                episodes.extend(on_episodes)
+
+            # 4) Mixed questions run K-1 fresh and merge 1 replay.
+            if final_mix_pairs:
+                mix_indices = [idx for idx, _ in final_mix_pairs]
+                exp_batch = _slice_batch_by_indices(rollout_batch, mix_indices)
+                replay_episodes = []
+                for _, q_id in final_mix_pairs:
+                    _, replay_ep = replay_lookup[q_id]
+                    replay_episodes.append(replay_ep)
+                fresh_exp = _rollout_batch(
+                    exp_batch,
+                    num_answers_per_question=max(exgrpo_k - 1, 1),
+                    rewrite_prefix=False,
+                    **rollout_kwargs,
+                )
+                episodes.extend(
+                    merge_replay_and_fresh_rollouts(replay_episodes, fresh_exp)
+                )
+        else:
+            episodes = _rollout_batch(
+                rollout_batch,
+                num_answers_per_question=exgrpo_k,
+                rewrite_prefix=False,
+                **rollout_kwargs,
+            )
+
         if device.type == "cuda":
             torch.cuda.synchronize()
             torch.cuda.empty_cache()
 
-        if config["training"]["skip_unfinished_episodes"]:
-            episodes = [ep for ep in episodes if ep.is_finished]
+        pass_at_1 = compute_pass_at_1(episodes)
+        if exgrpo_cfg.enabled and not exgrpo_mgr.activated:
+            activated_now = exgrpo_mgr.should_activate_exgrpo(pass_at_1)
+            if activated_now:
+                print(
+                    f"Step {step}: ExGRPO activated (pass@1={pass_at_1:.3f} "
+                    f">= {exgrpo_cfg.activation_threshold})"
+                )
+        exgrpo_stats["exgrpo_pass_at_1"] = pass_at_1
+        exgrpo_stats["exgrpo_activated"] = float(exgrpo_mgr.activated)
+
+        if exgrpo_cfg.enabled:
+            collect_stats = exgrpo_mgr.collect_from_rollouts(episodes)
+            exgrpo_stats.update({f"exgrpo_{k}": v for k, v in collect_stats.items()})
+            exgrpo_stats["exgrpo_buffer_size"] = float(len(exgrpo_mgr.buffer))
+            exgrpo_stats["exgrpo_buffer_traj"] = float(exgrpo_mgr.buffer.num_trajectories)
+            exgrpo_stats["exgrpo_retired"] = float(len(exgrpo_mgr.buffer.retired_set))
+
+        replenish_stats: dict[str, float] = {}
+        if adv_zero_drop_cfg.enabled:
+
+            def rollout_more():
+                extra_batch, extra_indices, extra_exhausted = fetch_next_batch()
+                if extra_exhausted or extra_batch is None:
+                    return []
+                extra_rollout_batch = rewrite_batch_with_r1_prefix(
+                    extra_batch, tokenizer=tokenizer, dataset_kind=dataset_kind
+                )
+                for idx, prefix in zip(extra_indices, extra_rollout_batch.prefix):
+                    index_to_qid[idx] = question_id_from_prefix(prefix)
+                return _rollout_batch(
+                    extra_rollout_batch,
+                    rewrite_prefix=False,
+                    **rollout_kwargs,
+                )
+
+            episodes, replenish_stats = collect_episodes_with_adv_zero_drop_replenish(
+                episodes,
+                replenish_cfg=adv_zero_drop_cfg,
+                rollout_more=rollout_more,
+            )
+            if replenish_stats.get("adv_zero_drop_replenish_rounds", 0) > 0:
+                print(
+                    f"Step {step}: adv-zero-drop replenish "
+                    f"{int(replenish_stats['adv_zero_drop_initial_usable'])} -> "
+                    f"{int(replenish_stats['adv_zero_drop_final_usable'])} "
+                    f"(target={adv_zero_drop_cfg.target_batch_size}, "
+                    f"rounds={int(replenish_stats['adv_zero_drop_replenish_rounds'])})"
+                )
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+
         if not episodes:
             print(f"Step {step}: all episodes filtered out, skip update.")
             continue
+
+        use_exgrpo_loss = exgrpo_mgr.activated and any(
+            ep.is_exp_group for ep in episodes
+        )
+        step_scale_by_std = (
+            scale_advantages_by_std if not use_exgrpo_loss else False
+        )
 
         results = update_policy(
             model=model,
@@ -360,12 +738,15 @@ def main(
             ppo_epochs=ppo_epochs,
             advantage_std_threshold=advantage_std_threshold,
             center_advantages=center_advantages,
-            scale_advantages_by_std=scale_advantages_by_std,
+            scale_advantages_by_std=step_scale_by_std,
             advantage_std_epsilon=advantage_std_epsilon,
             drop_zero_adv_groups=drop_zero_adv_groups,
             beta=beta,
             advantage_mode=advantage_mode,
             gspo_clip_len_scaling=gspo_clip_len_scaling,
+            use_exgrpo_loss=use_exgrpo_loss,
+            exgrpo_shaping_beta=exgrpo_cfg.beta,
+            exgrpo_rho=exgrpo_cfg.rho,
         )
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -375,16 +756,26 @@ def main(
         start_time = end_time
 
         reward = [ep.reward for ep in episodes]
-        accuracy = [ep.reward_info.get("accuracy_reward", ep.reward_info.get("answer_reward", 0.0)) for ep in episodes]
+        on_policy_episodes = [ep for ep in episodes if not ep.is_exp_group]
+        exp_group_episodes = [ep for ep in episodes if ep.is_exp_group]
+        replay_episodes = [ep for ep in episodes if ep.is_replay]
+        fresh_exp_episodes = [ep for ep in episodes if ep.is_exp_group and not ep.is_replay]
         format_r = [ep.reward_info.get("format_reward", 0.0) for ep in episodes]
-        length_b = [ep.reward_info.get("length_bonus", 0.0) for ep in episodes]
+        thinking_r = [
+            ep.reward_info.get("thinking_reward", ep.reward_info.get("length_bonus", 0.0))
+            for ep in episodes
+        ]
         thinking_chars = [ep.reward_info.get("thinking_chars", 0.0) for ep in episodes]
         num_finished = sum(ep.is_finished for ep in episodes)
         mean_reward = float(np.mean(reward))
         std_reward = float(np.std(reward))
-        success_rate = float(np.mean(accuracy))
+        success_rate = _success_rate_from_episodes(episodes) or 0.0
+        success_rate_on_policy = _success_rate_from_episodes(on_policy_episodes)
+        success_rate_exp_group = _success_rate_from_episodes(exp_group_episodes)
+        success_rate_replay = _success_rate_from_episodes(replay_episodes)
+        success_rate_fresh_exp = _success_rate_from_episodes(fresh_exp_episodes)
         mean_format = float(np.mean(format_r))
-        mean_length_bonus = float(np.mean(length_b))
+        mean_thinking = float(np.mean(thinking_r))
         mean_thinking_chars = float(np.mean(thinking_chars))
         grad_norm = results["grad_norm"]
         entropy = results["entropy"]
@@ -395,19 +786,56 @@ def main(
         ratio_mean = results["ratio_mean"]
         num_responses = results.get("num_responses", 0.0)
         nonzero_adv_frac = results.get("nonzero_adv_frac", 1.0)
+        group_reward_std_mean = results.get("group_reward_std_mean", 0.0)
+        kept_group_reward_std_mean = results.get("kept_group_reward_std_mean", 0.0)
+        group_below_threshold_frac = results.get("group_below_threshold_frac", 0.0)
+        advantage_std = results.get("advantage_std", 0.0)
+        replenish_rounds = replenish_stats.get("adv_zero_drop_replenish_rounds", 0.0)
+        adv_drop_final_usable = replenish_stats.get(
+            "adv_zero_drop_final_usable", float(len(episodes))
+        )
+        adv_drop_reached_target = replenish_stats.get(
+            "adv_zero_drop_reached_target", 1.0 if adv_zero_drop_cfg.enabled else 0.0
+        )
         ppo_epochs_ran = results.get("ppo_epochs_ran", 0)
         num_target_tokens = results.get("num_target_tokens", 0.0)
         loss = results["loss"]
         mean_resp_len = float(np.mean([len(ep.generated_token_ids) for ep in episodes]))
 
+        num_replay = len(replay_episodes)
+        exp_group_frac = float(len(exp_group_episodes) / max(len(episodes), 1))
+        replay_frac = float(num_replay / max(len(episodes), 1))
+        exgrpo_stats["exgrpo_num_replay"] = float(num_replay)
+        exgrpo_stats["exgrpo_exp_group_frac"] = exp_group_frac
+        exgrpo_stats["exgrpo_replay_frac"] = replay_frac
+
         print(
             f"Step {step}, mean_reward: {mean_reward:.3f}, "
-            f"accuracy: {success_rate:.3f}, format: {mean_format:.3f}, "
-            f"len_bonus: {mean_length_bonus:.3f}, think_chars: {mean_thinking_chars:.0f}, "
+            "accuracy(all/on/exp/replay/fresh): "
+            f"{success_rate:.3f}/"
+            f"{_fmt_optional_metric(success_rate_on_policy)}/"
+            f"{_fmt_optional_metric(success_rate_exp_group)}/"
+            f"{_fmt_optional_metric(success_rate_replay)}/"
+            f"{_fmt_optional_metric(success_rate_fresh_exp)}, "
+            f"format: {mean_format:.3f}, "
+            f"thinking: {mean_thinking:.3f}, think_chars: {mean_thinking_chars:.0f}, "
             f"grad_norm: {grad_norm:.2f}, duration: {duration:.2f}, "
             f"mean_response_len: {mean_resp_len:.0f}, entropy: {entropy:.2f}, "
             f"clip_frac: {clip_fraction:.3f}, approx_kl: {approx_kl:.4f}, "
-            f"nonzero_adv: {nonzero_adv_frac:.2f}, epochs: {ppo_epochs_ran}"
+            f"nonzero_adv: {nonzero_adv_frac:.2f}, "
+            f"group_std: {group_reward_std_mean:.4f}, "
+            f"kept_group_std: {kept_group_reward_std_mean:.4f}, "
+            f"adv_std: {advantage_std:.3f}, "
+            f"usable_eps: {int(adv_drop_final_usable)}, "
+            f"repl_rounds: {int(replenish_rounds)}, epochs: {ppo_epochs_ran}"
+            + (
+                f", exgrpo: on={int(exgrpo_stats['exgrpo_n_on'])}/"
+                f"exp={int(exgrpo_stats['exgrpo_n_exp'])}, "
+                f"buf={int(exgrpo_stats['exgrpo_buffer_size'])}, "
+                f"pass@1={exgrpo_stats['exgrpo_pass_at_1']:.3f}"
+                if exgrpo_cfg.enabled
+                else ""
+            )
         )
 
         if step % config["training"]["eval_interval"] == 0:
@@ -423,45 +851,93 @@ def main(
             print(f"Eval accuracy: {eval_sr:.3f}")
             tb_writer.add_scalar("success_rate/eval", eval_sr, step)
 
-        tb_writer.add_scalar("loss", loss, step)
-        tb_writer.add_scalar("mean_reward", mean_reward, step)
-        tb_writer.add_scalar("std_reward", std_reward, step)
-        tb_writer.add_scalar("success_rate/train", success_rate, step)
-        tb_writer.add_scalar("format_reward", mean_format, step)
-        tb_writer.add_scalar("length_bonus", mean_length_bonus, step)
-        tb_writer.add_scalar("thinking_chars", mean_thinking_chars, step)
-        tb_writer.add_scalar("grad_norm", grad_norm, step)
-        tb_writer.add_scalar("duration", duration, step)
-        tb_writer.add_scalar("num_finished_episodes", num_finished, step)
-        tb_writer.add_scalar("mean_response_len", mean_resp_len, step)
-        tb_writer.add_scalar("entropy", entropy, step)
-        tb_writer.add_scalar("clip_fraction", clip_fraction, step)
-        tb_writer.add_scalar("approx_kl", approx_kl, step)
-        tb_writer.add_scalar("ppo_loss", ppo_loss, step)
-        tb_writer.add_scalar("kl_loss", kl_loss, step)
-        tb_writer.add_scalar("ratio_mean", ratio_mean, step)
-        tb_writer.add_scalar("num_target_tokens", num_target_tokens, step)
-        tb_writer.add_scalar("num_responses", num_responses, step)
-        tb_writer.add_scalar("nonzero_adv_frac", nonzero_adv_frac, step)
-        tb_writer.add_scalar("ppo_epochs_ran", ppo_epochs_ran, step)
-        for i, ep in enumerate(episodes[:4]):
-            text = html.escape(ep.text)
-            tb_writer.add_text(f"text_{i}", f"<pre>{text}</pre>", step)
+        core_scalar_metrics = {
+            "loss": loss,
+            "mean_reward": mean_reward,
+            "success_rate/train": success_rate,
+            "grad_norm": grad_norm,
+            "duration": duration,
+            "mean_response_len": mean_resp_len,
+            "entropy": entropy,
+            "clip_fraction": clip_fraction,
+            "approx_kl": approx_kl,
+            "ppo_loss": ppo_loss,
+            "kl_loss": kl_loss,
+            "ratio_mean": ratio_mean,
+            "num_target_tokens": num_target_tokens,
+        }
+        for key, value in core_scalar_metrics.items():
+            tb_writer.add_scalar(key, value, step)
+
+        if success_rate_on_policy is not None:
+            tb_writer.add_scalar("success_rate/train_on_policy", success_rate_on_policy, step)
+        if success_rate_exp_group is not None:
+            tb_writer.add_scalar("success_rate/train_exp_group", success_rate_exp_group, step)
+        if success_rate_replay is not None:
+            tb_writer.add_scalar("success_rate/train_exp_replay", success_rate_replay, step)
+        if success_rate_fresh_exp is not None:
+            tb_writer.add_scalar("success_rate/train_exp_fresh", success_rate_fresh_exp, step)
+
+        if tb_verbose_metrics:
+            verbose_scalar_metrics = {
+                "std_reward": std_reward,
+                "format_reward": mean_format,
+                "thinking_reward": mean_thinking,
+                "thinking_chars": mean_thinking_chars,
+                "num_finished_episodes": float(num_finished),
+                "num_responses": num_responses,
+                "nonzero_adv_frac": nonzero_adv_frac,
+                "group_reward_std_mean": group_reward_std_mean,
+                "kept_group_reward_std_mean": kept_group_reward_std_mean,
+                "group_below_threshold_frac": group_below_threshold_frac,
+                "advantage_std": advantage_std,
+                "adv_zero_drop_replenish_rounds": replenish_rounds,
+                "adv_zero_drop_final_usable": adv_drop_final_usable,
+                "adv_zero_drop_reached_target": adv_drop_reached_target,
+                "ppo_epochs_ran": float(ppo_epochs_ran),
+            }
+            for key, value in verbose_scalar_metrics.items():
+                tb_writer.add_scalar(key, value, step)
+
+        if exgrpo_cfg.enabled:
+            core_exgrpo_keys = {
+                "exgrpo_n_exp_target",
+                "exgrpo_n_exp_candidate",
+                "exgrpo_n_exp",
+                "exgrpo_n_on",
+                "exgrpo_buffer_size",
+                "exgrpo_activated",
+                "exgrpo_pass_at_1",
+                "exgrpo_num_replay",
+                "exgrpo_exp_group_frac",
+                "exgrpo_replay_frac",
+            }
+            for key, value in exgrpo_stats.items():
+                if tb_verbose_metrics or key in core_exgrpo_keys:
+                    tb_writer.add_scalar(key.replace("exgrpo_", "exgrpo/"), value, step)
+
+        if tb_text_samples > 0:
+            for i, ep in enumerate(episodes[:tb_text_samples]):
+                text = html.escape(ep.text)
+                tb_writer.add_text(f"text_{i}", f"<pre>{text}</pre>", step)
 
         if step % config["training"]["ckpt_save_interval"] == 0:
-            output_file = ckpt_dir / f"ckpt_{step:06d}.pt"
-            if use_lora:
-                checkpoint = build_lora_checkpoint_payload(
-                    step,
-                    model,
-                    optimizer,
-                    base_model_path=pretrained_model_path,
-                    lora_config=lora_cfg,
-                )
-                torch.save(checkpoint, output_file)
-            else:
-                torch.save(model.state_dict(), output_file)
-            print(f"Saved checkpoint to {output_file}")
+            output_file = save_training_checkpoint(
+                ckpt_dir,
+                step,
+                use_lora=use_lora,
+                model=model,
+                optimizer=optimizer,
+                base_model_path=pretrained_model_path if use_lora else None,
+                lora_config=lora_cfg if use_lora else None,
+                exgrpo_manager=exgrpo_mgr if exgrpo_cfg.enabled else None,
+            )
+            exgrpo_msg = (
+                f", {format_exgrpo_storage_summary(manager=exgrpo_mgr)}"
+                if exgrpo_cfg.enabled
+                else ""
+            )
+            print(f"Saved checkpoint to {output_file}{exgrpo_msg}")
 
 
 if __name__ == "__main__":

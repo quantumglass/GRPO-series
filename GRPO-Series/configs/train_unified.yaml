@@ -1,4 +1,4 @@
-# 统一训练配置：多数据集 + LoRA + GSPO/PPO
+# 统一训练：多数据集 + LoRA + GSPO/PPO（无 ExGRPO）
 # 用法: uv run python train_unified.py --config configs/train_unified.yaml
 
 model:
@@ -7,7 +7,7 @@ model:
   dtype: "bfloat16"
 
 dataset:
-  # 可选: countdown | dapo_math_17k | deepscaler
+  # countdown | dapo_math_17k | deepscaler
   name: "deepscaler"
   countdown_path: "data/Countdown-Tasks-3to4"
   dapo_parquet_path: "data/DAPO-Math-17k/data/dapo-math-17k.parquet"
@@ -15,7 +15,6 @@ dataset:
   test_size: 256
 
 training:
-  # 可选: full | lora
   mode: "lora"
   random_seed: 1337
   max_prompt_len: 1024
@@ -27,13 +26,13 @@ training:
     top_p: 1.0
     top_k: 0
 
-  # PPO 裁剪 + GSPO 响应级优势
   use_ppo_clip: true
-  advantage_mode: "gspo"          # grpo | gspo
-  gspo_clip_len_scaling: "sqrt"   # linear | sqrt | none
-  beta: 0.02                      # KL 惩罚系数
-  clip_ratio_low: 0.2
-  clip_ratio_high: 0.28
+  advantage_mode: "gspo"
+  # FSPO: log-space clip band ≈ c * sqrt(L)；c≈0.03
+  gspo_clip_len_scaling: "sqrt"
+  beta: 0.02
+  clip_ratio_low: 3.0e-2
+  clip_ratio_high: 3.0e-2
   ppo_epochs: 2
 
   advantage_std_threshold: 1.0e-6
@@ -49,6 +48,7 @@ training:
   learning_rate: 1.0e-5
   weight_decay: 0.1
   betas: [0.9, 0.99]
+  memory_efficient_adamw: false
 
   lora:
     r: 32
@@ -62,4 +62,3 @@ training:
   skip_unfinished_episodes: false
   ckpt_save_interval: 10
   eval_interval: 10
-  memory_efficient_adamw: false

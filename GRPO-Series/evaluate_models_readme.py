@@ -1,10 +1,3 @@
-"""
-Transformers 口径基线评测（对齐 Qwen 官方 README 推理方式）。
-
-用于与 evaluate_models.py 的结果交叉验证。
-用法: uv run python evaluate_models_readme.py --config configs/eval.yaml --types base
-"""
-
 import json
 import shutil
 from argparse import ArgumentParser
@@ -17,11 +10,19 @@ import torch
 import yaml
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from benchmark_task import answer_matches, extract_pred_answer, normalize_math_answer
+from benchmark_task import (
+    answer_matches,
+    extract_pred_answer,
+    is_aime_benchmark,
+    normalize_aime_answer,
+    normalize_math_answer,
+)
 from eval_metrics import (
     build_benchmark_result,
     format_pass_at_k_summary,
-    pass_at_k_unbiased,
+    is_pass_at_k_solved,
+    pass_at_k_simple,
+    resolve_eval_benchmarks,
     resolve_pass_at_k_config,
 )
 from lora import LoRAConfig, apply_lora_to_model, load_lora_state_dict
@@ -33,12 +34,13 @@ README_SYSTEM_PROMPT = "You are Qwen, created by Alibaba Cloud. You are a helpfu
 class EvalProgress:
     """Simple in-place progress counter for evaluation loops."""
 
-    def __init__(self, total: int, desc: str):
+    def __init__(self, total: int, desc: str, *, display_k: int = 1):
         self.total = max(total, 1)
         self.desc = desc
+        self.display_k = display_k
         self.done = 0
-        self.correct_sum = 0
-        self.pass_at_1_sum = 0.0
+        self.pass_rate_sum = 0.0
+        self.solved_sum = 0
         self.gen_done = 0
         self.gen_total = 0
 
@@ -53,10 +55,10 @@ class EvalProgress:
         self.gen_done = min(self.gen_done + n, self.gen_total)
         self._render()
 
-    def update(self, n: int, *, correct_delta: int = 0, pass_at_1_delta: float = 0.0) -> None:
+    def update(self, n: int, *, pass_rate_delta: float = 0.0, solved_delta: int = 0) -> None:
         self.done += n
-        self.correct_sum += correct_delta
-        self.pass_at_1_sum += pass_at_1_delta
+        self.pass_rate_sum += pass_rate_delta
+        self.solved_sum += solved_delta
         self.gen_done = 0
         self.gen_total = 0
         self._render()
@@ -70,8 +72,11 @@ class EvalProgress:
             f"\r{self.desc} [{bar}] {self.done}/{self.total} ({pct:5.1f}%)"
         )
         if self.done > 0:
-            acc = self.pass_at_1_sum / self.done
-            msg += f" acc={acc:.4f} ({self.correct_sum}/{self.done})"
+            rate = self.pass_rate_sum / self.done
+            msg += (
+                f" pass@{self.display_k}={rate:.4f} "
+                f"({self.solved_sum}/{self.done})"
+            )
         if self.gen_total > 0:
             gen_pct = 100.0 * self.gen_done / self.gen_total
             msg += f" | gen {self.gen_done}/{self.gen_total} ({gen_pct:5.1f}%)"
@@ -227,6 +232,11 @@ def extract_ground_truth(row: dict[str, Any], benchmark_name: str) -> str:
         if row.get("answer") is not None:
             return normalize_math_answer(str(row["answer"]))
         return normalize_math_answer(str(row.get("solution", "")).strip())
+
+    if is_aime_benchmark(name):
+        if row.get("answer") is not None:
+            return normalize_aime_answer(str(row["answer"]))
+        raise KeyError("AIME row is missing required field 'answer'.")
 
     for key in ("answer", "final_answer", "ground_truth", "target"):
         if key in row and row[key] is not None:
@@ -416,7 +426,10 @@ def evaluate_target_benchmarks(
     show_progress: bool,
 ) -> dict[str, Any]:
     per_target: dict[str, Any] = {}
-    for benchmark_name, benchmark_cfg in config["benchmarks"].items():
+    eval_cfg = config.get("eval", {})
+    for benchmark_name, benchmark_cfg in resolve_eval_benchmarks(
+        config["benchmarks"], eval_cfg
+    ):
         (
             benchmark_batch_size,
             benchmark_max_gen_len,
@@ -470,7 +483,7 @@ def evaluate_target_benchmarks(
         )
         print(
             f"  accuracy={one['accuracy']:.4f} ({one['correct']}/{one['total']}), "
-            f"{format_pass_at_k_summary(one['pass_at_k'])}"
+            f"{format_pass_at_k_summary(one['pass_at_k'], num_samples=num_samples)}"
         )
         per_target[benchmark_name] = one
     return per_target
@@ -587,14 +600,20 @@ def evaluate_one_benchmark(
     pass_at_k = pass_at_k or [1]
     num_samples = max(int(num_samples), 1)
     question_batch_size = max(1, batch_size // num_samples)
+    display_k = max(pass_at_k)
 
     rows = load_rows(Path(benchmark_path))
     questions = [extract_question(r) for r in rows]
     ground_truth = [extract_ground_truth(r, benchmark_name) for r in rows]
 
     total = len(rows)
-    correct_counts: list[int] = []
-    progress = EvalProgress(total=total, desc=progress_desc) if show_progress else None
+    sample_results: list[list[bool]] = []
+    first_sample_correct: list[bool] = []
+    progress = (
+        EvalProgress(total=total, desc=progress_desc, display_k=display_k)
+        if show_progress
+        else None
+    )
     try:
         for q_batch, gt_batch in zip(
             batched(questions, question_batch_size),
@@ -638,31 +657,39 @@ def evaluate_one_benchmark(
                 if progress is not None:
                     progress.update_generate(len(chunk_prompts))
 
-            batch_counts = [0] * num_q
+            batch_samples = [[False] * num_samples for _ in range(num_q)]
+            batch_first_correct = [False] * num_q
             for idx, (response, gt) in enumerate(zip(all_responses, expanded_gt)):
                 qi = idx // num_samples
+                si = idx % num_samples
                 pred = extract_pred_answer(response, dataset_name=benchmark_name)
-                if answer_matches(pred, gt, dataset_name=benchmark_name):
-                    batch_counts[qi] += 1
-            correct_counts.extend(batch_counts)
+                is_correct = answer_matches(pred, gt, dataset_name=benchmark_name)
+                batch_samples[qi][si] = is_correct
+                if si == 0 and is_correct:
+                    batch_first_correct[qi] = True
+            sample_results.extend(batch_samples)
+            first_sample_correct.extend(batch_first_correct)
             if progress is not None:
-                batch_correct = sum(1 for c in batch_counts if c > 0)
-                batch_pass_at_1 = sum(
-                    pass_at_k_unbiased(num_samples, c, 1) for c in batch_counts
+                batch_pass_rate = sum(
+                    pass_at_k_simple(s, display_k) for s in batch_samples
+                )
+                batch_solved = sum(
+                    1 for s in batch_samples if is_pass_at_k_solved(s, display_k)
                 )
                 progress.update(
                     num_q,
-                    correct_delta=batch_correct,
-                    pass_at_1_delta=batch_pass_at_1,
+                    pass_rate_delta=batch_pass_rate,
+                    solved_delta=batch_solved,
                 )
     finally:
         if progress is not None:
             progress.close()
 
     return build_benchmark_result(
-        correct_counts=correct_counts,
+        sample_results=sample_results,
         num_samples=num_samples,
         pass_at_k=pass_at_k,
+        first_sample_correct=first_sample_correct,
     )
 
 

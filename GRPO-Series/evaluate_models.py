@@ -1,10 +1,3 @@
-"""
-多模型基准评测：GSM8K + MATH-500（自研模型栈）。
-
-支持 base / full / lora 多 checkpoint 对比，可选 pass@k。
-用法: uv run python evaluate_models.py --config configs/eval.yaml
-"""
-
 import json
 import shutil
 from argparse import ArgumentParser
@@ -24,7 +17,9 @@ from benchmark_task import (
 from eval_metrics import (
     build_benchmark_result,
     format_pass_at_k_summary,
-    pass_at_k_unbiased,
+    is_pass_at_k_solved,
+    pass_at_k_simple,
+    resolve_eval_benchmarks,
     resolve_pass_at_k_config,
 )
 from lora import LoRAConfig, apply_lora_to_model, load_lora_state_dict
@@ -193,23 +188,27 @@ def resolve_benchmark_eval_params(
 class EvalProgress:
     """Simple in-place progress counter for evaluation loops."""
 
-    def __init__(self, total: int, desc: str):
+    def __init__(self, total: int, desc: str, *, display_k: int = 1):
         self.total = max(total, 1)
         self.desc = desc
+        self.display_k = display_k
         self.done = 0
-        self.pass_at_1_sum = 0.0
+        self.pass_rate_sum = 0.0
+        self.solved_sum = 0
 
-    def update(self, n: int, pass_at_1_delta: float = 0.0) -> None:
+    def update(self, n: int, *, pass_rate_delta: float = 0.0, solved_delta: int = 0) -> None:
         self.done += n
-        self.pass_at_1_sum += pass_at_1_delta
-        pass_at_1 = self.pass_at_1_sum / self.done if self.done else 0.0
+        self.pass_rate_sum += pass_rate_delta
+        self.solved_sum += solved_delta
+        rate = self.pass_rate_sum / self.done if self.done else 0.0
         pct = 100.0 * self.done / self.total
         bar_width = 24
         filled = int(bar_width * self.done / self.total)
         bar = "=" * filled + "-" * (bar_width - filled)
         print(
             f"\r{self.desc} [{bar}] {self.done}/{self.total} "
-            f"({pct:5.1f}%) pass@1={pass_at_1:.4f}",
+            f"({pct:5.1f}%) pass@{self.display_k}={rate:.4f} "
+            f"({self.solved_sum}/{self.done})",
             end="",
             flush=True,
         )
@@ -322,7 +321,10 @@ def evaluate_target(
 ) -> dict[str, Any]:
     target_name = target["name"]
     model_result = {}
-    for benchmark_name, benchmark_cfg in config["benchmarks"].items():
+    eval_cfg = config.get("eval", {})
+    for benchmark_name, benchmark_cfg in resolve_eval_benchmarks(
+        config["benchmarks"], eval_cfg
+    ):
         benchmark_batch_size, benchmark_max_gen_len, benchmark_sampling = (
             resolve_benchmark_eval_params(
                 config=config,
@@ -368,7 +370,7 @@ def evaluate_target(
         print(
             f"    accuracy={one['accuracy']:.4f} "
             f"({one['correct']}/{one['total']}), "
-            f"{format_pass_at_k_summary(one['pass_at_k'])}"
+            f"{format_pass_at_k_summary(one['pass_at_k'], num_samples=num_samples)}"
         )
         model_result[benchmark_name] = one
     return model_result
@@ -469,6 +471,7 @@ def evaluate_one_benchmark(
     pass_at_k = pass_at_k or [1]
     num_samples = max(int(num_samples), 1)
     question_batch_size = max(1, eval_batch_size // num_samples)
+    display_k = max(pass_at_k)
 
     dataset = GenericMathBenchmarkDataset(
         tokenizer=tokenizer,
@@ -483,9 +486,14 @@ def evaluate_one_benchmark(
     )
 
     total = len(dataset)
-    correct_counts: list[int] = []
+    sample_results: list[list[bool]] = []
+    first_sample_correct: list[bool] = []
     desc = progress_desc or benchmark_name
-    progress = EvalProgress(total=total, desc=desc) if show_progress else None
+    progress = (
+        EvalProgress(total=total, desc=desc, display_k=display_k)
+        if show_progress
+        else None
+    )
     try:
         for batch in dataloader:
             num_q = len(batch.ground_truth)
@@ -511,25 +519,38 @@ def evaluate_one_benchmark(
                     )
                 )
 
-            batch_counts = [0] * num_q
+            batch_samples = [[False] * num_samples for _ in range(num_q)]
+            batch_first_correct = [False] * num_q
             for idx, (response, gt) in enumerate(zip(all_responses, expanded_gt)):
                 qi = idx // num_samples
+                si = idx % num_samples
                 pred = extract_pred_answer(response, dataset_name=benchmark_name)
-                if answer_matches(pred, gt, dataset_name=benchmark_name):
-                    batch_counts[qi] += 1
-            correct_counts.extend(batch_counts)
+                is_correct = answer_matches(pred, gt, dataset_name=benchmark_name)
+                batch_samples[qi][si] = is_correct
+                if si == 0 and is_correct:
+                    batch_first_correct[qi] = True
+            sample_results.extend(batch_samples)
+            first_sample_correct.extend(batch_first_correct)
             if progress is not None:
-                batch_pass_at_1 = sum(
-                    pass_at_k_unbiased(num_samples, c, 1) for c in batch_counts
+                batch_pass_rate = sum(
+                    pass_at_k_simple(s, display_k) for s in batch_samples
                 )
-                progress.update(num_q, pass_at_1_delta=batch_pass_at_1)
+                batch_solved = sum(
+                    1 for s in batch_samples if is_pass_at_k_solved(s, display_k)
+                )
+                progress.update(
+                    num_q,
+                    pass_rate_delta=batch_pass_rate,
+                    solved_delta=batch_solved,
+                )
     finally:
         if progress is not None:
             progress.close()
     return build_benchmark_result(
-        correct_counts=correct_counts,
+        sample_results=sample_results,
         num_samples=num_samples,
         pass_at_k=pass_at_k,
+        first_sample_correct=first_sample_correct,
     )
 
 

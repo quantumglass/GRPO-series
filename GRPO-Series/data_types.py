@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 
 @dataclass
@@ -15,6 +15,9 @@ class Episode:
     is_finished: bool
     reward: float
     reward_info: Dict[str, float]
+    is_replay: bool = False
+    is_exp_group: bool = False
+    past_token_log_probs: Optional[List[float]] = None
 
 
 @dataclass
